@@ -1,0 +1,40 @@
+use_default_settings: true
+general:
+  debug: false
+  instance_name: "SearXNG (local)"
+  enable_metrics: false
+server:
+  bind_address: "127.0.0.1"
+  port: 8888
+  limiter: false
+  # The secret_key is a placeholder. The installer replaces it with a freshly
+  # generated value (openssl rand -hex 32) at deploy time.
+  secret_key: "__SEARXNG_SECRET_KEY__"
+  image_proxy: false
+# Disabling the valkey/redis cache lets a bare machine without a running
+# valkey or redis daemon still serve SearXNG requests.
+valkey:
+  url: false
+search:
+  # safe_search: 2 = strict. The default. preferences.lock below pins this
+  # level so neither the web UI nor a per-request ?safesearch= parameter can
+  # relax it. dsh never sends a safesearch parameter, so all of its searches
+  # inherit this strict level.
+  safe_search: 2
+  autocomplete: "duckduckgo"
+  # "json" MUST be listed here. SearXNG's built-in default is [html] only,
+  # and a /search request for the JSON format is rejected with a 403 when it
+  # is absent from this list. The dsh web_search plugin consumes JSON, so
+  # this entry is mandatory for it to work.
+  formats:
+    - html
+    - json
+preferences:
+  # Locking safesearch prevents it from being changed at request time or via
+  # the web UI, enforcing the strict (2) level set above.
+  lock:
+    - safesearch
+outgoing:
+  enable_http2: true
+  request_timeout: 5.0
+  max_request_timeout: 15.0

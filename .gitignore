@@ -1,0 +1,6 @@
+# Local packaging output (release assets are uploaded to GitHub Releases)
+*.tar.gz
+*.tar.gz.sha256
+
+# Editor / OS noise
+.DS_Store
