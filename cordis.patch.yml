@@ -1,0 +1,56 @@
+# SearXNG-backed web_search wiring for DeepSeek Harness (dsh).
+# This file is placed at $DSH_HOME/cordis.patch.yml (by install.sh) and is
+# composed over every profile (last-write-wins per id).
+#
+# Row 1 — switch the web seam's search provider to SearXNG:
+#   A patch row REPLACES the entire `config` block, so `fetchProvider: http`
+#   MUST be restated here to keep `web_fetch` working. Omitting it would
+#   silently break web_fetch (the seam would have no fetch provider).
+#   `searchProvider: searxng` selects our SearXNG plugin by its provider id.
+- id: web
+  config:
+    searchProvider: searxng
+    fetchProvider: http
+
+# Row 2 — disable the built-in DeepSeek search provider:
+#   Kept in the composition (not removed) but disabled, so the seam never
+#   reaches it. This avoids any fallback to DeepSeek's hosted search.
+- id: web-search-deepseek
+  disabled: true
+
+# Row 3 — mount the SearXNG plugin module from an absolute path:
+#   The `name:` field here is the module path the dsh loader resolves into a
+#   `file://` URI. It MUST be an absolute path (the loader only rewrites
+#   absolute/relative paths into `file://` URIs; a bare package name will not
+#   resolve from this layer). The path points at the plugin copy that
+#   install.sh places under the plugin dir (default: $HOME/searxng-web-search/).
+#   The `__DSH_HOME__` placeholder is expanded by install.sh to the parent of
+#   the plugin dir before the file is written.
+#   NOTE: module code changes do NOT hot-reload — the ESM loader caches the
+#   plugin by its file:// URL, and a long-running dsh process can lose config
+#   hot-reload entirely (its HMR watcher dies; a patched change then simply
+#   never takes effect until the process is restarted). So: after upgrading
+#   the installed plugin, RESTART dsh once; the fresh process imports the new
+#   module from this same path with no suffix needed. (A version-suffix name
+#   such as index.v2.js only helps when the process's reload path is alive —
+#   verify the patch edit actually took effect before relying on it.)
+#
+#   The `config:` block (all fields optional; precedence: config > env > default):
+#     url     — SearXNG base URL              (env DSH_SEARXNG_URL,     default http://127.0.0.1:8888)
+#     engines — list or comma string of SearXNG engine names
+#               (env DSH_SEARXNG_ENGINES, default: duckduckgo,brave,google,
+#                google cse,bing,mojeek,ecosia,startpage,yahoo)
+#     max     — per-request result cap        (env DSH_SEARXNG_MAX,     default 30)
+#
+#   If your instance has engines suspended (CAPTCHA / rate-limited — see
+#   `unresponsive_engines` in the JSON response or the SearXNG admin UI), pin
+#   the responsive subset here, e.g.:
+#     config:
+#       engines: ["google cse", "bing", "mojeek", "ecosia", "startpage"]
+#   Config-block changes hot-reload while the process's watcher is alive (no
+#   dsh restart needed) — but in a long-running process that watcher may be
+#   dead, in which case even config changes need a restart to take effect.
+- insert:
+    - id: web-search-searxng
+      name: __DSH_HOME__/searxng-web-search/index.js
+      config: {}

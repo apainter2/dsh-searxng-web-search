@@ -1,0 +1,79 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Runs the install-script syntax checks plus the full plugin test suite
+# (config cases + a live JSON search) against a throwaway SearXNG at the
+# pinned ref. Mirrors searxng/searxng-install.sh steps 1-4 minus the
+# service installation (no sudo/systemd in CI).
+
+jobs:
+  verify:
+    name: scripts + plugin suite (live SearXNG)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Syntax checks
+        run: |
+          bash -n install.sh
+          bash -n searxng/searxng-install.sh
+          node --check plugin/index.js
+
+      - name: Provision SearXNG at the pinned ref (CI only, no service)
+        run: |
+          set -euo pipefail
+
+          # Single source of truth: the pinned commit lives in the installer.
+          REF="$(sed -nE 's/^SEARXNG_REF="\$\{SEARXNG_REF:-([0-9a-fA-F]+)\}".*/\1/p' searxng/searxng-install.sh | head -n1)"
+          [ -n "$REF" ] || { echo "cannot extract pinned SEARXNG_REF from installer (format changed?)"; exit 1; }
+          echo "Pinned SearXNG ref: $REF"
+
+          export UV_PYTHON_INSTALL_DIR="$RUNNER_TEMP/.uv-python"
+          export UV_CACHE_DIR="$RUNNER_TEMP/.uv-cache"
+
+          uv venv --python 3.13 "$RUNNER_TEMP/venv"
+          git clone https://github.com/searxng/searxng.git "$RUNNER_TEMP/searxng"
+          git -C "$RUNNER_TEMP/searxng" checkout --detach "$REF"
+          uv pip install --python "$RUNNER_TEMP/venv/bin/python" -r "$RUNNER_TEMP/searxng/requirements.txt"
+
+          # Settings: the runbook's own template, with a fresh CI-only secret.
+          SECRET="$(openssl rand -hex 32)"
+          sed "s/__SEARXNG_SECRET_KEY__/$SECRET/" searxng/settings.template.yml > "$RUNNER_TEMP/ci-settings.yml"
+
+          # Run like the service unit does, but as a bare background process.
+          cd "$RUNNER_TEMP/searxng"
+          SEARXNG_SETTINGS_PATH="$RUNNER_TEMP/ci-settings.yml" \
+            nohup "$RUNNER_TEMP/venv/bin/python" -m searx.webapp \
+            > "$RUNNER_TEMP/searxng.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/searxng.pid"
+
+          # Wait for healthz (up to ~60s)
+          code=000
+          for _ in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8888/healthz || true)"
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+          if [ "$code" != "200" ]; then
+            echo "::error::SearXNG /healthz never returned 200"
+            tail -n 50 "$RUNNER_TEMP/searxng.log"
+            exit 1
+          fi
+          echo "SearXNG healthy at 127.0.0.1:8888"
+
+      - name: Plugin test suite (live search)
+        run: node plugin/test.mjs
+
+      - name: Stop SearXNG
+        if: always()
+        run: kill "$(cat "$RUNNER_TEMP/searxng.pid")" 2>/dev/null || true

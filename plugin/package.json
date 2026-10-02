@@ -1,0 +1,7 @@
+{
+  "name": "dsh-web-search-searxng",
+  "version": "1.0.1",
+  "type": "module",
+  "private": true,
+  "description": "SearXNG-backed web_search provider plugin for DeepSeek Harness (dsh)"
+}
