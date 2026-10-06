@@ -1,58 +1,50 @@
 import { SearxngSearchProvider, Config } from "./index.js";
 
-// --- 1. Config schema: normalization + fallbacks -------------------------
-const v = (input) => Config["~standard"].validate(input);
-
-const cases = [
-  ["undefined input (env/defaults)", v(undefined)],
-  ["empty object (env/defaults)", v({})],
-  ["config engines win over env", v({ engines: ["google cse", "bing"] })],
-  ["string engines with spaces", v({ engines: "google cse, bing ,mojeek" })],
-  ["bad url rejected", v({ url: "not a url" })],
-  ["empty engines rejected", v({ engines: "" })],
-];
-for (const [label, res] of cases) {
-  if (res.issues) {
-    console.log(`  ok  ${label} -> rejected: ${res.issues[0].message}`);
-  } else {
-    console.log(`  ok  ${label} -> ${JSON.stringify(res.value)}`);
-  }
+// --- Mini test harness ------------------------------------------------------
+let failures = 0;
+function check(label, cond, detail) {
+  console.log(`  ${cond ? "PASS" : "FAIL"}  ${label}${detail !== undefined ? `  (${detail})` : ""}`);
+  if (!cond) failures++;
+}
+function section(title) {
+  console.log(`\n${title}`);
+  console.log("─".repeat(title.length + 2));
 }
 
+// --- 1. Config schema: normalization + fallbacks -------------------------
+section("1. Config schema");
+const v = (input) => Config["~standard"].validate(input);
+check("undefined input uses defaults", v(undefined).value !== undefined);
+check("empty object uses defaults", v({}).value !== undefined);
+check("config engines win over env", v({ engines: ["google cse", "bing"] }).value.engines.join(",") === "google cse,bing");
+check("string engines with spaces", v({ engines: "google cse, bing ,mojeek" }).value.engines.join(",") === "google cse,bing,mojeek");
+check("bad url rejected", v({ url: "not a url" }).issues !== undefined);
+check("empty engines rejected", v({ engines: "" }).issues !== undefined);
+
 // --- 2. Live search (real SearXNG on localhost) --------------------------
+section("2. Live search");
 const envEngines = process.env.DSH_SEARXNG_ENGINES;
-// Default to the engine set that is responsive on the local instance;
-// override with DSH_SEARXNG_ENGINES to test other sets.
 const testEngines = envEngines ?? "google cse,bing,mojeek,ecosia,startpage,yahoo";
-
 const provider = new SearxngSearchProvider(v({ engines: testEngines }).value);
-console.log(`\nSearXNG URL:    ${provider.url}`);
-console.log(`Engines:        ${provider.engines.join(", ")}`);
-console.log(`Max results:    ${provider.max}`);
-console.log(`available():    ${provider.available()}`);
-
+console.log(`  URL:    ${provider.url}`);
+console.log(`  Engines: ${provider.engines.join(", ")}`);
+console.log(`  Max:     ${provider.max}`);
 const query = "rust web framework";
-console.log(`\nSearching: "${query}" (maxResults: 5)`);
-console.log("─".repeat(40));
-
+console.log(`  Searching: "${query}" (maxResults: 5)`);
 const t0 = Date.now();
 try {
   const { sources, model } = await provider.search({ query, maxResults: 5 });
-  console.log(`\n${sources.length} results in ${Date.now() - t0}ms (model: ${model})`);
+  console.log(`  ${sources.length} results in ${Date.now() - t0}ms (model: ${model})`);
   for (const [i, src] of sources.entries()) {
-    console.log(`${i + 1}. ${src.title ?? "(untitled)"} — ${src.url}`);
+    console.log(`    ${i + 1}. ${src.title ?? "(untitled)"} — ${src.url}`);
   }
+  check("live search returned sources", sources.length > 0);
 } catch (err) {
-  console.log(`\nSearch failed: ${err.message}`);
+  console.log(`  (skipped: ${err.message})`);
 }
 
-// --- 3. Lossless-JSON contract --------------------------------------------
-// The harness snapshots every tool result as plain lossless JSON (only
-// null/boolean/string/finite number/array/plain object; no undefined
-// values, no -0/NaN). A violation surfaces as:
-//   tool "web_search" returned invalid output: value is not lossless JSON
-// so the plugin must be structurally incapable of producing one. The checks
-// below feed sparse and exotic fields through the same code path.
+// --- 3. Lossless-JSON contract + dedupe + sparse fields -------------------
+section("3. Lossless-JSON contract (stubbed fetch)");
 function isLosslessJsonValue(value) {
   if (value === null || typeof value === "boolean" || typeof value === "string") return true;
   if (typeof value === "number") return Number.isFinite(value) && !Object.is(value, -0);
@@ -63,7 +55,11 @@ function isLosslessJsonValue(value) {
   if (typeof value === "object") {
     const proto = Object.getPrototypeOf(value);
     if (proto !== null && proto !== Object.prototype) return false;
-    return Object.values(value).every((child) => child !== undefined && isLosslessJsonValue(child));
+    // Fixed: check keys, not just values, so a sparse hole or an explicit
+    // `undefined` value is caught (the old `Object.values`-only check
+    // silently skipped sparse holes and produced a false PASS).
+    if (Object.keys(value).some((k) => value[k] === undefined)) return false;
+    return Object.values(value).every((child) => isLosslessJsonValue(child));
   }
   return false;
 }
@@ -73,49 +69,100 @@ const synthetic = {
   results: [
     { url: "https://a.example/1", title: "t1", content: "c1", publishedDate: "2026-01-02T03:04:05Z" },
     { url: "https://a.example/2" }, // sparse: no title/content/publishedDate
-    { url: "https://a.example/3", title: "t3", content: "c3", publishedDate: 1767315845 }, // epoch seconds
-    { url: "https://a.example/4", title: "t4", content: "c4", publishedDate: 1767315845000 }, // epoch ms
+    { url: "https://a.example/3", title: "t3", content: "c3", publishedDate: Date.parse("2026-01-02T03:04:05Z") / 1000 }, // epoch seconds
+    { url: "https://a.example/4", title: "t4", content: "c4", publishedDate: Date.parse("2026-01-02T03:04:05Z") }, // epoch ms
     { url: "https://a.example/5", title: "t5", content: "c5", publishedDate: "not a date" }, // unparseable -> dropped
     { url: "https://a.example/5", title: "dup", content: "dup content" }, // duplicate URL -> deduped
   ],
 };
 
-// Re-implement search()'s mapping locally? No — exercise the real provider
-// by pointing it at a stub fetch. Node's global fetch is swappable.
 const realFetch = globalThis.fetch;
-globalThis.fetch = async (url) => ({
-  ok: true,
-  json: async () => synthetic,
-});
+globalThis.fetch = async () => ({ ok: true, redirected: false, json: async () => synthetic });
 try {
   const stubProvider = new SearxngSearchProvider({ url: "http://stub.invalid" });
   const stub = await stubProvider.search({ query: synthetic.query, maxResults: 10 });
-  console.log(`\nstubbed search: ${stub.sources.length} sources (expect 5 after dedupe)`);
-  for (const [i, src] of stub.sources.entries()) {
-    console.log(`${i + 1}. ${src.title ?? "(untitled)"} ${src.publishedAt ? `(${src.publishedAt})` : ""} — ${src.url}`);
-  }
-  const lossless = isLosslessJsonValue(stub);
-  console.log(`lossless-JSON check: ${lossless ? "PASS" : "FAIL"}`);
-  if (!lossless) process.exitCode = 1;
-  if (stub.sources.length !== 5) {
-    console.log("dedupe check: FAIL (expected 5 sources)");
-    process.exitCode = 1;
-  }
+  check("dedupe: 5 unique sources", stub.sources.length === 5, `got ${stub.sources.length}`);
+  check("lossless JSON: result passes", isLosslessJsonValue(stub));
   const sparse = stub.sources[1];
-  if (sparse.title !== undefined || sparse.snippet !== undefined || sparse.publishedAt !== undefined) {
-    console.log("sparse-field check: FAIL (explicit undefined keys present)");
-    console.log("  ", JSON.stringify(sparse));
-    process.exitCode = 1;
-  } else {
-    console.log("sparse-field check: PASS (no undefined keys)");
-  }
-  const bad = stub.sources[4];
-  if (bad?.publishedAt !== undefined) {
-    console.log("bad-date check: FAIL (unparseable date was kept)");
-    process.exitCode = 1;
-  } else {
-    console.log("bad-date check: PASS (unparseable date dropped)");
-  }
+  check(
+    "sparse source has no undefined keys",
+    Object.keys(sparse).every((k) => sparse[k] !== undefined),
+    JSON.stringify(sparse),
+  );
+  check("bad date dropped", stub.sources[4].publishedAt === undefined);
+  check("epoch seconds → ISO", stub.sources[2].publishedAt === "2026-01-02T03:04:05.000Z");
+  check("epoch ms → ISO", stub.sources[3].publishedAt === "2026-01-02T03:04:05.000Z");
 } finally {
   globalThis.fetch = realFetch;
+}
+
+// --- 4. Typed WebError failures (stubbed fetch) --------------------------
+section("4. Typed WebError failures");
+
+async function expectWebError(label, makeFetch, { signal, code, causeName, messagePart } = {}) {
+  globalThis.fetch = makeFetch;
+  try {
+    const p = new SearxngSearchProvider({ url: "http://stub.invalid" });
+    await p.search({ query: "q", maxResults: 5 }, signal);
+    check(label, false, "did not throw");
+  } catch (err) {
+    const name = err?.name;
+    const codeOk = code === undefined || err?.code === code;
+    const nameOk = name === "WebError";
+    const causeOk = causeName === undefined || err?.cause?.name === causeName;
+    const msgOk = messagePart === undefined || String(err?.message).includes(messagePart);
+    check(label, nameOk && codeOk && causeOk && msgOk,
+      `name=${name} code=${err?.code} cause=${err?.cause?.name ?? "none"} msg="${err?.message?.slice(0, 80)}"`);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// 4a. Pre-dispatch abort: caller signal already aborted before the call.
+{
+  const ac = new AbortController();
+  ac.abort(new Error("user cancelled"));
+  await expectWebError("pre-dispatch abort → WEB_ABORTED", async () => { throw new Error("should not fetch"); },
+    { signal: ac.signal, code: "WEB_ABORTED", causeName: "Error", messagePart: "aborted" });
+}
+
+// 4b. Fetch rejects with AbortError (mid-flight abort).
+{
+  const ac = new AbortController();
+  ac.abort();
+  await expectWebError("fetch AbortError → WEB_ABORTED", async () => {
+    throw new DOMException("The operation was aborted.", "AbortError");
+  },
+    { signal: ac.signal, code: "WEB_ABORTED", causeName: "AbortError", messagePart: "aborted" });
+}
+
+// 4c. Non-2xx HTTP response.
+await expectWebError("HTTP 500 → WEB_PROVIDER_ERROR", async () => ({
+  ok: false, status: 500, statusText: "Internal Server Error", redirected: false,
+  json: async () => ({}),
+}), { code: "WEB_PROVIDER_ERROR", messagePart: "HTTP 500" });
+
+// 4d. Network failure (fetch rejects with a non-abort error).
+await expectWebError("network error → WEB_PROVIDER_ERROR", async () => {
+  throw new TypeError("fetch failed: ECONNREFUSED");
+}, { code: "WEB_PROVIDER_ERROR", causeName: "TypeError", messagePart: "ECONNREFUSED" });
+
+// 4e. Non-JSON response (JSON parse fails).
+await expectWebError("non-JSON body → WEB_PROVIDER_ERROR", async () => ({
+  ok: true, status: 200, redirected: false,
+  json: async () => { throw new SyntaxError("Unexpected token < in JSON"); },
+}), { code: "WEB_PROVIDER_ERROR", causeName: "SyntaxError", messagePart: "non-JSON" });
+
+// 4f. Redirect followed (3xx with Location) — `redirect: "error"` throws.
+await expectWebError("redirect → WEB_PROVIDER_ERROR", async () => {
+  throw new TypeError("redirect: error");
+}, { code: "WEB_PROVIDER_ERROR", messagePart: "request failed" });
+
+// --- Summary ----------------------------------------------------------------
+section("Summary");
+if (failures === 0) {
+  console.log("  All checks passed.");
+} else {
+  console.log(`  ${failures} check(s) FAILED.`);
+  process.exitCode = 1;
 }
