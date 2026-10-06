@@ -15,6 +15,32 @@ Startpage, and Yahoo; per-instance overrides supported), while leaving
 | `web_search` | DeepSeek-hosted search (relative dates, opaque source) | Local SearXNG → resilient multi-engine set (absolute URLs, snippets, published dates) |
 | `web_fetch` | dsh built-in HTTP fetch | **Unchanged** — still uses the `http` fetch provider |
 
+### How failures surface
+
+When a search **fails** (backend unreachable, non-2xx, a redirected/mis-shaped
+response, or a cancelled request), the plugin throws a **`WebError`** with a
+stable `code` and a human-readable `message` — the same convention dsh's
+built-in web providers use — rather than a bare `Error`. This matters because
+the harness snapshots a tool's result as lossless JSON, which empties the
+`message` of a bare `Error`: without the typed throw, a failed search surfaced
+to the model as a blank error and read as "no results". With it, the agent
+sees *why* the search failed and can act on it.
+
+| Failure | `code` | Typical `message` |
+|---|---|---|
+| SearXNG returns a non-2xx status | `WEB_PROVIDER_ERROR` | `SearXNG search failed: HTTP 500 …` |
+| Network error (host down / refused / DNS) | `WEB_PROVIDER_ERROR` | `SearXNG search request failed: TypeError: fetch failed …` |
+| Response redirected (3xx) | `WEB_PROVIDER_ERROR` | `SearXNG search request failed: TypeError: redirect: error` |
+| Body isn't JSON | `WEB_PROVIDER_ERROR` | `SearXNG returned a non-JSON response (…)` |
+| Caller's `AbortSignal` fired (pre- or mid-flight) | `WEB_ABORTED` | `SearXNG search aborted` |
+
+The plugin is mounted from a path **outside** dsh's install closure, where the
+`@deepseek-ai/dsh-web` package is not resolvable — so `index.js` defines an
+equivalent `WebError` locally (same `code`/`cause`/`name` shape, zero
+dependencies) instead of importing the dsh one. The dsh seam routes on those
+fields, not on `instanceof`, so the stand-in is fully interchangeable with
+the built-in provider's errors.
+
 ---
 
 ## Prerequisites
@@ -252,6 +278,7 @@ curl -s http://127.0.0.1:8888/config | jq '.preferences.safesearch'
 ```
 searxng-web-search/
   README.md                  ← you are here
+  UPGRADING.md               ← how to upgrade an already-deployed install (e.g. 1.0.1 → 1.1.0)
   install.sh                 ← per-machine installer (copy plugin, write patch, optional SearXNG)
   cordis.patch.yml           ← reference home-level patch template (3 rows, with comments)
   plugin/
@@ -279,3 +306,4 @@ searxng-web-search/
 | Plugin loads but `available()` returns false | `DSH_SEARXNG_URL` is set to a malformed URL (e.g. missing scheme). Must be `http://…` or `https://…`. |
 | Module code changes not taking effect | ESM loader caches by `file://` URL, so a running process keeps the module it imported at boot. Restarting dsh is the reliable fix. Renaming `name:` (version suffix, e.g. `index.v2.js`) *can* force a re-import — but only while the process's config hot-reload is alive; a long-running process (especially `dsh web` GUI sessions) can lose that watcher, after which **no** patch edit takes effect until a restart. Verify the edit actually took effect (new behavior / a fresh write in `~/.dsh`) before relying on it. |
 | `web_search` fails with "value is not lossless JSON" on every attempt | The running process has a **stale cached copy of the plugin** (an older version imported at boot under the same `file://` URL) whose output the current harness rejects — the on-disk plugin may already be fixed, but the process never re-imported it (see the row above). Fix: restart dsh. The current plugin version guards its output with a lossless-JSON self-check, so once the fresh process imports it, this error cannot recur. |
+| `web_search` failed but the message looked **empty** (and read like "no results") | Pre-1.1.0 behavior: a bare `Error`'s message was emptied by the harness's lossless-JSON snapshot, so a real backend failure (SearXNG down, non-2xx, non-JSON) surfaced as a blank error. v1.1.0 throws a typed `WebError` (`WEB_PROVIDER_ERROR` / `WEB_ABORTED`) with a populated `message` instead — if you still see a blank/`null` message, the running process is on an **older cached copy** of the plugin: restart dsh so it imports the current module (see the row above). |
