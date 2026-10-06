@@ -63,6 +63,53 @@ function toIsoDate(value) {
 }
 
 /**
+ * A harness-compatible web error, mirroring `dsh-web`'s `WebError`
+ * (`class WebError extends HarnessError`, which sets `code` from the second
+ * constructor argument and `name` to the class name). We re-implement it
+ * here instead of importing `@deepseek-ai/dsh-web`: a Cordis plugin is
+ * evaluated at its mount location (e.g. `~/searxng-web-search`) where the
+ * dsh workspace is not on the module-resolution path, so a bare import of
+ * `@deepseek-ai/dsh-web` would throw at plugin load and break `web_search`
+ * outright. The shape below is a faithful stand-in for the dsh-web version
+ * — same base class, same `code`/`cause` fields, same `name` — so the seam
+ * can route it by code and the tool layer can render its `message`.
+ *
+ * Why throw instead of returning `{ sources: [], error }`: the harness
+ * snapshots tool *values* with lossless-JSON, and an `error` string would
+ * round-trip fine but would be swallowed by the model as "no results" —
+ * the failure would silently read as an empty search. A thrown `WebError`
+ * becomes a structured `isError` tool result whose message the agent sees,
+ * and its `code` (WEB_ABORTED, WEB_PROVIDER_ERROR, …) is machine-routable
+ * without the agent parsing prose.
+ */
+class WebError extends Error {
+  /** Stable machine-routable failure class. */
+  code;
+  constructor(message, code, options) {
+    super(message, options);
+    this.code = code;
+    this.name = new.target.name;
+  }
+}
+
+/** True for a fetch/`AbortSignal` abort, surfaced as `WEB_ABORTED`. */
+function isAbortError(error) {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+/** Build the provider's stable cancellation error while retaining the reason. */
+function searchAborted(signal, fallback) {
+  return new WebError("SearXNG search aborted", "WEB_ABORTED", {
+    cause: signal?.aborted === true ? signal.reason : fallback,
+  });
+}
+
+/** Throw the provider's stable cancellation error when the caller aborted. */
+function throwIfSearchAborted(signal) {
+  if (signal?.aborted === true) throw searchAborted(signal);
+}
+
+/**
  * Recursively assert that a value is plain lossless JSON: only null, boolean,
  * string, finite non-negative-zero numbers, arrays, and objects with the
  * plain Object.prototype (no undefined values, no exotic prototypes).
@@ -80,7 +127,13 @@ function isLosslessJsonValue(value) {
   if (typeof value === "object") {
     const proto = Object.getPrototypeOf(value);
     if (proto !== null && proto !== Object.prototype) return false;
-    return Object.values(value).every((child) => child !== undefined && isLosslessJsonValue(child));
+    // Own *keys* (not values) are lossless-JSON-unsafe: a sparse hole or an
+    // explicit `undefined` serializes to `{ "k": null }` / drops the key,
+    // which the harness's snapshot then rejects. `Object.keys` includes
+    // holes and `undefined` values; `Object.values` silently skips holes —
+    // this is the exact trap the old check fell into.
+    if (Object.keys(value).some((k) => value[k] === undefined)) return false;
+    return Object.values(value).every((child) => isLosslessJsonValue(child));
   }
   return false;
 }
@@ -171,6 +224,12 @@ export class SearxngSearchProvider {
   }
 
   async search(request, signal) {
+    // Cooperative cancellation: the seam forwards the tool's caller signal,
+    // and we mirror the DeepSeek provider convention by re-throwing it as a
+    // stable WEB_ABORTED WebError (with the caller's reason as `cause`)
+    // rather than letting a raw AbortError leak into the tool result.
+    throwIfSearchAborted(signal);
+
     const params = new URLSearchParams();
     params.set("q", request.query);
     params.set("format", "json");
@@ -178,15 +237,54 @@ export class SearxngSearchProvider {
     if (this.#engines.length > 0) params.set("engines", this.#engines.join(","));
 
     const url = `${this.#url}/search?${params}`;
-    const res = await fetch(url, {
-      headers: { "User-Agent": USER_AGENT, accept: "application/json" },
-      signal,
-    });
+    let res;
+    try {
+      // `redirect: "error"` turns a redirect (a 3xx with a Location header)
+      // into a rejection we can classify below, instead of silently
+      // following it — SearXNG should answer JSON directly, and a redirect
+      // means the instance is misconfigured or the URL was hijacked.
+      res = await fetch(url, {
+        headers: { "User-Agent": USER_AGENT, accept: "application/json" },
+        signal,
+        redirect: "error",
+      });
+    } catch (error) {
+      // Distinguish caller-side aborts from provider/network failures: the
+      // seam already cancelled the caller, so we re-throw as WEB_ABORTED
+      // with the caller's reason preserved as `cause`.
+      if (signal?.aborted === true || isAbortError(error)) throw searchAborted(signal, error);
+      // Network / DNS / redirect-error failures: a typed provider error so
+      // the tool layer renders a human-readable message and routes on code.
+      throw new WebError(
+        `SearXNG search request failed: ${String(error)}`,
+        "WEB_PROVIDER_ERROR",
+        { cause: error },
+      );
+    }
+    if (res.redirected) {
+      throw new WebError(
+        `SearXNG search followed a redirect to ${res.url}; configure a direct endpoint`,
+        "WEB_PROVIDER_ERROR",
+      );
+    }
     if (!res.ok) {
-      throw new Error(`SearXNG request failed: HTTP ${res.status} ${res.statusText}`);
+      throw new WebError(
+        `SearXNG search failed: HTTP ${res.status} ${res.statusText}`,
+        "WEB_PROVIDER_ERROR",
+      );
     }
 
-    const body = await res.json();
+    let body;
+    try {
+      body = await res.json();
+    } catch (error) {
+      if (signal?.aborted === true || isAbortError(error)) throw searchAborted(signal, error);
+      throw new WebError(
+        `SearXNG returned a non-JSON response (${String(error)})`,
+        "WEB_PROVIDER_ERROR",
+        { cause: error },
+      );
+    }
     const results = Array.isArray(body?.results) ? body.results : [];
 
     // De-duplicate by URL, preserving order (SearXNG may return repeats
