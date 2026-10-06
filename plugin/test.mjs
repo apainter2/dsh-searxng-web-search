@@ -38,9 +38,18 @@ try {
   for (const [i, src] of sources.entries()) {
     console.log(`    ${i + 1}. ${src.title ?? "(untitled)"} — ${src.url}`);
   }
-  check("live search returned sources", sources.length > 0);
+  check("live search returned sources", sources.length > 0, `${sources.length} returned`);
 } catch (err) {
-  console.log(`  (skipped: ${err.message})`);
+  // Distinguish a real plugin failure (typed WebError) from an external
+  // SearXNG outage (network/abort). CI provisions a live SearXNG, so a
+  // genuine plugin bug should throw a WebError; a transient outage is an
+  // environment failure, not a plugin failure, and is reported (not
+  // failed) so the suite exits non-zero only on a plugin defect.
+  if (err?.name === "WebError") {
+    check("live search did not throw a WebError", false, `code=${err?.code} msg="${err?.message}"`);
+  } else {
+    console.log(`  (skipped — non-WebError, treated as an environment issue: ${err?.message})`);
+  }
 }
 
 // --- 3. Lossless-JSON contract + dedupe + sparse fields -------------------
