@@ -5,6 +5,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 The version number mirrors the `version` field in [`plugin/package.json`](plugin/package.json).
 
+## [1.1.0] - 2026-10-06
+
+### Changed
+
+- **Search failures now surface as typed `WebError`s** (mirroring the dsh
+  provider convention used by the built-in DeepSeek/HTTP web providers)
+  instead of a bare `Error` whose message the harness's lossless-JSON
+  snapshot silently emptied. Previously a failed search read to the model
+  as "no results"; now the agent sees a human-readable `message` and a
+  machine-routable `code`:
+  - `WEB_PROVIDER_ERROR` — non-2xx response, network failure, a followed
+    redirect (now `fetch({ redirect: "error" })`), or a non-JSON body.
+  - `WEB_ABORTED` — the caller's `AbortSignal` fired (pre-dispatch or mid
+    flight), rethrown with the caller's reason preserved as `cause` so a
+    cancelled search reads as a cancellation, not a provider error.
+- The failure type is a **local** `WebError` (same `code`/`cause`/`name`
+  shape as `dsh-web`'s `WebError`) rather than an import of
+  `@deepseek-ai/dsh-web`: the plugin is evaluated at its mount path
+  (`~/searxng-web-search`) where the dsh workspace is not on the module
+  resolution path, so a bare import would crash at plugin load and break
+  `web_search` outright. The dsh seam routes on `code`/`message` fields,
+  not `instanceof`, so the stand-in is fully interchangeable.
+
+### Fixed
+
+- **Lossless-JSON self-guard rejected the wrong things.** The recursive
+  guard checked only `Object.values`, which silently *skips* sparse holes —
+  so an object with an `undefined`/hole value passed the check and only blew
+  up at the harness's snapshot. It now checks own **keys** (a hole or an
+  explicit `undefined` value fails), so a malformed SearXNG response is
+  dropped at the source instead of tripping the harness's snapshot with
+  "value is not lossless JSON".
+
+### Added
+
+- **Typed-error tests.** `plugin/test.mjs` grew a real PASS/FAIL harness and
+  new cases covering the pre-dispatch abort, the mid-flight abort, the
+  non-2xx, the network failure, the non-JSON body, and the followed-redirect
+  failure — asserting the thrown `WebError`'s `code`, `message`, and
+  `cause` in each. The live-search step now fails only on a plugin-defect
+  `WebError`, skipping (with a note) a transient environment outage so the
+  suite's exit code reflects a plugin bug rather than an external SearXNG
+  blip.
+
 ## [1.0.1] - 2026-10-02
 
 ### Changed
