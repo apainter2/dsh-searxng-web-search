@@ -278,6 +278,7 @@ curl -s http://127.0.0.1:8888/config | jq '.preferences.safesearch'
 ```
 searxng-web-search/
   README.md                  ← you are here
+  UPGRADING.md               ← how to upgrade an already-deployed install (e.g. 1.0.1 → 1.1.0)
   install.sh                 ← per-machine installer (copy plugin, write patch, optional SearXNG)
   cordis.patch.yml           ← reference home-level patch template (3 rows, with comments)
   plugin/
